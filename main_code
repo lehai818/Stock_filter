@@ -1,0 +1,192 @@
+from vnstock3 import Vnstock
+import pandas as pd 
+import os 
+import requests 
+import numpy as np 
+import time 
+
+from vnstock3 import Vnstock
+stock = Vnstock().stock(symbol= 'HPG', source='TCBS')
+df = stock.listing.all_symbols()
+#print (df)
+symbols = df['ticker'].tolist()
+
+
+def get_stock_data (symbol,start,end):
+    stock = Vnstock().stock(symbol=symbol, source='TCBS')
+    df = stock.quote.history(start=start, end = end, interval='1D')
+    return df 
+
+# Tính ATR và Chandelier exit 
+
+def calculate_atr(df, period=14):
+    # Tính các giá trị True Range (TR)
+    df['high_low'] = df['high'] - df['low']
+    df['high_close'] = abs(df['high'] - df['close'].shift())
+    df['low_close'] = abs(df['low'] - df['close'].shift())
+
+    # TR là giá trị lớn nhất giữa ba phương pháp tính trên
+    df['tr'] = df[['high_low', 'high_close', 'low_close']].max(axis=1)
+
+    # Tính ATR bằng cách lấy trung bình TR trong một khoảng thời gian nhất định
+    df['atr'] = df['tr'].rolling(window=period, min_periods=1).mean()
+
+    return df['atr']
+
+
+# Hàm tính Chandelier Exit
+def chandelier_exit(df, length=22, mult=3.0):
+
+    # Tính ATR
+    calculate_atr(df, period=14)
+
+    # Kiểm tra xem cột 'close' có tồn tại không
+    if 'close' not in df.columns:
+        print("Lỗi: DataFrame không có cột 'close'.")
+        return None
+    
+    # Kiểm tra xem DataFrame có rỗng không
+    if df.empty:
+        print("Lỗi: DataFrame trống.")
+        return None
+
+    # Tính Long Stop
+    df['long_stop'] = df['close'].rolling(window=length).max() - df['atr'] * mult
+
+    # Tính Short Stop
+    df['short_stop'] = df['close'].rolling(window=length).min() + df['atr'] * mult
+    
+    # Tính Long Stop với xác nhận
+    df['long_stop_prev'] = df['long_stop'].shift(1)
+    df['long_stop'] = df.apply(lambda row: max(row['long_stop'], row['long_stop_prev']) 
+                               if row['close'] > row['long_stop_prev'] else row['long_stop'], axis=1)
+
+    # Tính Short Stop với xác nhận
+    df['short_stop_prev'] = df['short_stop'].shift(1)
+    df['short_stop'] = df.apply(lambda row: min(row['short_stop'], row['short_stop_prev']) 
+                                if row['close'] < row['short_stop_prev'] else row['short_stop'], axis=1)
+
+    # Xác định hướng
+    df['direction'] = 1  # Mặc định là long
+    df['direction'] = df.apply(lambda row: 1 if row['close'] > row['short_stop_prev'] 
+                               else (-1 if row['close'] < row['long_stop_prev'] else row['direction']), axis=1)
+
+    # Tạo tín hiệu Mua/Bán
+    df['buy_signal'] = (df['direction'] == 1) & (df['direction'].shift(1) == -1)
+    df['sell_signal'] = (df['direction'] == -1) & (df['direction'].shift(1) == 1)
+
+    return df
+
+
+
+#tính sma, ema, wt,rsi,stochastic
+
+def sma(series, period):
+    return  series.rolling(window=period).mean()
+
+# Hàm tính EMA
+def ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
+
+# Hàm tính chỉ báo WaveTrend (WT)
+def wavetrend(df, chlen=9, avg=12, malen=3):
+    hlc3 = (df['high'] + df['low'] + df['close']) / 3
+    esa = ema(hlc3, chlen)
+    de = ema(np.abs(hlc3 - esa), chlen)
+    ci = (hlc3 - esa) / (0.015 * de)
+    wt1 = ema(ci, avg)
+    wt2 = sma(wt1, malen)
+    
+    # Thêm các cột wt1 và wt2 vào DataFrame
+    df['wt1'] = wt1
+    df['wt2'] = wt2
+    return df
+
+def rsi(df, period=14):
+    delta = df.close.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+
+
+def stochastic(df, k_period=14, d_period=3):
+    low_min = df['low'].rolling(window=k_period).min()
+    high_max = df['high'].rolling(window=k_period).max()
+    k = 100 * ((df['close'] - low_min) / (high_max - low_min))
+    d = sma(k, d_period)
+    df ['k'] = k 
+    df ['d'] = d
+    return df 
+
+
+def check_wavetrend_status(df, overbought_level=60, oversold_level=-60):
+
+    #Hàm kiểm tra trạng thái quá mua/quá bán của chỉ báo WaveTrend cho toàn bộ DataFrame.
+
+    # Tạo cột 'status' dựa trên điều kiện quá mua hoặc quá bán
+    df['status'] = df['wt2'].apply(lambda x: '1.2.1' if x >= overbought_level else ('1.2.2' if x <= oversold_level else None))
+    
+    return df
+
+
+def ma_volume(df, window=20):
+    # Tính trung bình khối lượng giao dịch trong 'window' phiên gần nhất.
+    df['MA_vol_20'] = df['volume'].rolling(window=window).mean()
+
+
+def vol_signal (df):
+    df['vol_signal'] = df.apply(lambda row: 1 if row['volume'] > row['MA_vol_20'] else 0, axis=1)
+
+def check_status_and_notify(df,  count, symbol):
+    # Lấy 3 hàng cuối cùng của DataFrame
+    last_rows = df.tail(1)
+    symbols_over_sell = []
+    symbols_over_buy = []
+    # Sửa đổi: Sử dụng đúng cấu trúc tuple của iterrows()
+    for _, row in last_rows.iterrows():  # _, row để bỏ qua chỉ số của hàng
+        # Lấy giá trị của cột 'time' và chuyển đổi thành chuỗi
+        time_value = row['time'].strftime('%Y-%m-%d') if hasattr(row['time'], 'strftime') else str(row['time'])
+        long_stop = row['long_stop']  # Truy cập giá trị của cột 'long_stop' từ Series 'row'
+        
+        if row['vol_signal'] == "1" and row['status'] == '1.2.1' :  # Over Buy
+            print (f"________________cổ phiếu {symbol} đang ở trạng thái quá mua  ")
+            # Thêm symbol vào danh sách symbols over buy 
+            
+            
+        elif row['vol_signal'] == "1" and row['status'] == '1.2.2' :  # Over Sell  
+            print (f"________________cổ phiếu {symbol} đang ở trạng thái quá bán  ")
+            # Thêm symbol vào danh sách symbols_over sell
+
+
+stock = Vnstock().stock(symbol= 'HPG', source='TCBS')
+df = stock.listing.all_symbols()
+#print (df)
+symbols = df['ticker'].tolist()
+count = 1
+
+for symbol in symbols: 
+    try:
+        # Lấy dữ liệu
+        df2 = get_stock_data(symbol=symbol, start='2024-05-01', end='2024-09-17')
+        # Áp dụng các chỉ báo lên df2 (dữ liệu vừa lấy)
+        df2 = chandelier_exit(df2, length=22, mult=3.0)
+        rsi(df2, period=14)
+        stochastic(df2, k_period=14, d_period=3)
+        wavetrend(df2, chlen=9, avg=12, malen=3)
+        check_wavetrend_status(df2, overbought_level=55, oversold_level=-55)
+        ma_volume (df2,10)
+        vol_signal (df2)
+        # print ('check xong fund signal')
+        check_status_and_notify(df2,count,symbol)
+        print (f"{count} đã tính toán xong dữ liệu cho cổ phiếu {symbol}")
+        count += 1 
+        
+          
+
+        time.sleep (5)
+
+    except Exception as e:
+        print(f"Lỗi khi tải dữ liệu cho {symbol}: {str(e)}")
+        count += 1
+        
